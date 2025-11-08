@@ -519,33 +519,22 @@ automaticamente la regla de que en una factura no puede contener productos de
 diferentes familias. En caso de que esto ocurra no debe grabarse esa factura y
 debe emitirse un error en pantalla*/
 
-CREATE TRIGGER EJ21 ON FACTURA FOR INSERT
+CREATE TRIGGER EJ21 ON Item_Factura FOR INSERT
 AS
 BEGIN
-	DECLARE @tipo CHAR(1), @sucursal CHAR(4), @numero CHAR(8)
-	DECLARE C1 CURSOR FOR
-		SELECT fact_tipo, fact_sucursal, fact_numero
-		FROM inserted
-	OPEN C1
-	FETCH NEXT FROM C1 INTO @tipo, @sucursal, @numero
-	WHILE @@FETCH_STATUS = 0
+	IF EXISTS(SELECT * 
+				FROM inserted
+				JOIN Producto ON item_producto = prod_codigo
+				GROUP BY item_numero, item_tipo, item_sucursal
+				HAVING COUNT(DISTINCT prod_familia) > 1
+				)
 	BEGIN
-		IF (SELECT COUNT(DISTINCT prod_familia)
-			FROM Producto
-			JOIN Item_Factura ON prod_codigo = item_producto
-			JOIN Factura ON item_tipo + item_sucursal + item_numero = @tipo + @sucursal + @numero
-			GROUP BY item_tipo, item_sucursal, item_numero 
-			) > 1
-		BEGIN
-			DELETE FROM Item_Factura 
-				WHERE item_tipo + item_sucursal + item_numero = @tipo + @sucursal + @numero
-			ROLLBACK TRANSACTION
-			RAISERROR('NO SE PUEDE CREAR LA FACTURA',1,1)
-		END
-		FETCH NEXT FROM C1 INTO @tipo, @sucursal, @numero
+		DELETE FROM Item_Factura 
+			WHERE item_numero + item_tipo + item_sucursal IN (SELECT item_numero + item_tipo + item_sucursal FROM inserted)
+		DELETE FROM Factura
+			WHERE fact_numero + fact_tipo + fact_sucursal IN (SELECT item_numero + item_tipo + item_sucursal FROM inserted)
+		RAISERROR('NO SE PUEDEN FACTURAR PRODUCTOS DE DISTINTAS FAMILIAS')
 	END
-	CLOSE C1
-	DEALLOCATE C1
 END
 GO
 /*22. Se requiere recategorizar los rubros de productos, de forma tal que nigun rubro
@@ -568,7 +557,7 @@ BEGIN
 	BEGIN
 		IF @cant > 20
 		BEGIN
-			EXEC dbo.RECATEGORIZAR(@rubro, @cant)
+			EXEC dbo.RECATEGORIZAR @rubro, @cant
 		END
 		FETCH C1 INTO @rubro
 	END
@@ -606,41 +595,105 @@ GO
 automaticamante se controle que en una misma factura no puedan venderse más
 de dos productos con composición. Si esto ocurre debera rechazarse la factura.*/
 
-CREATE TRIGGER EJ23 ON Factura FOR INSERT
+CREATE TRIGGER EJ23 ON Item_Factura FOR INSERT
 AS
 BEGIN
-	IF EXISTS(SELECT COUNT(item_producto) 
-		FROM Item_Factura 
-		JOIN inserted ON item_numero + item_tipo + item_sucursal = fact_numero + fact_tipo + fact_sucursal
+	IF EXISTS(SELECT COUNT(DISTINCT item_producto) 
+		FROM inserted 
 		JOIN Composicion ON item_producto = comp_producto
-		GROUP BY fact_numero, fact_tipo, fact_sucursal
+		GROUP BY item_numero, item_tipo, item_sucursal
 		HAVING COUNT(DISTINCT item_producto) > 2)
 	BEGIN
-		DECLARE @tipo CHAR(1), @numero CHAR(8), @sucursal CHAR(4)
-		DECLARE C1 CURSOR FOR 
-			SELECT fact_tipo, fact_numero, fact_sucursal FROM inserted GROUP BY fact_tipo, fact_numero, fact_sucursal
-		OPEN C1
-		FETCH C1 INTO @tipo, @numero, @sucursal
-		WHILE @@FETCH_STATUS = 0
-		BEGIN
-			DELETE FROM Item_Factura 
-				WHERE item_tipo + item_numero + item_sucursal = @tipo + @numero + @sucursal
-			DELETE FROM Factura
-				WHERE fact_tipo + fact_numero + fact_sucursal = @tipo + @numero + @sucursal
-			FETCH C1 INTO @tipo, @numero, @sucursal
-		END
-		CLOSE C1
-		DEALLOCATE C1
-		RAISERROR('NO SE PUEDE CREAR UNA FACTURA CON MAS DE 2 PRODUCTOS COMPUESTOS. FACTURA RECHAZADA',1,1)
+		DELETE FROM Item_Factura
+			WHERE item_numero + item_tipo + item_sucursal IN (SELECT item_numero + item_tipo + item_sucursal 
+																FROM Item_Factura 
+																JOIN Composicion ON item_producto = comp_producto
+																GROUP BY item_numero + item_tipo + item_sucursal
+																HAVING COUNT(DISTINCT item_producto) > 2) 
+		DELETE FROM Factura
+			WHERE fact_numero + fact_tipo + fact_sucursal IN (SELECT item_numero + item_tipo + item_sucursal FROM inserted GROUP BY item_numero + item_tipo + item_sucursal)
 	END
 END
 GO
 
+/*24. Se requiere recategorizar los encargados asignados a los depositos. Para ello
+cree el o los objetos de bases de datos necesarios que lo resueva, teniendo en
+cuenta que un deposito no puede tener como encargado un empleado que
+pertenezca a un departamento que no sea de la misma zona que el deposito, si
+esto ocurre a dicho deposito debera asignársele el empleado con menos
+depositos asignados que pertenezca a un departamento de esa zona.*/
+
+CREATE PROCEDURE EJ24
+AS
+BEGIN
+	DECLARE @empleado NUMERIC(6), @deposito CHAR(2), @zonaDepo CHAR(3), @zonaEmpl CHAR(3)
+	DECLARE C1 CURSOR FOR
+		SELECT depo_encargado, depo_codigo, depo_zona, depa_zona
+		FROM Empleado 
+		JOIN Departamento ON empl_departamento = depa_codigo
+		JOIN DEPOSITO ON depo_encargado = empl_codigo
+		WHERE depo_zona <> depa_zona
+	OPEN C1
+	FETCH C1 INTO @empleado, @deposito, @zonaDepo, @zonaEmpl
+	WHILE @@FETCH_STATUS = 0
+	BEGIN
+		UPDATE DEPOSITO
+			SET depo_encargado = (SELECT TOP 1 empl_codigo	
+									FROM Empleado 
+									JOIN Departamento ON empl_departamento = depa_codigo
+									LEFT JOIN DEPOSITO ON empl_codigo = depo_encargado
+									WHERE depa_zona = @zonaDepo
+									GROUP BY empl_codigo
+									ORDER BY COUNT(DISTINCT depo_codigo) 
+									)
+			WHERE depo_codigo = @deposito
+		FETCH C1 INTO @empleado, @deposito, @zonaDepo, @zonaEmpl
+	END
+	CLOSE C1
+	DEALLOCATE C1
+END
+GO
+
+/*25. Desarrolle el/los elementos de base de datos necesarios para que no se permita
+que la composición de los productos sea recursiva, o sea, que si el producto A
+compone al producto B, dicho producto B no pueda ser compuesto por el
+producto A, hoy la regla se cumple.*/
+
+CREATE TRIGGER EJ25 ON Composicion FOR INSERT, UPDATE
+AS
+BEGIN
+	IF EXISTS(SELECT * 
+				FROM inserted c1 
+				JOIN Composicion c2 ON c1.comp_producto = c2.comp_componente AND c2.comp_producto = c1.comp_componente 
+				WHERE c1.comp_producto <> c2.comp_producto)
+	ROLLBACK TRANSACTION
+END
+GO
 
 /*26. Desarrolle el/los elementos de base de datos necesarios para que se cumpla
 automaticamente la regla de que una factura no puede contener productos que
 sean componentes de otros productos. En caso de que esto ocurra no debe
 grabarse esa factura y debe emitirse un error en pantalla*/
+
+CREATE TRIGGER EJ26 ON Item_Factura FOR INSERT
+AS
+BEGIN
+	IF EXISTS(SELECT item_producto 
+				FROM inserted
+				WHERE item_producto IN (SELECT comp_componente FROM Composicion))
+	BEGIN
+		DELETE FROM Item_Factura
+			WHERE item_numero + item_tipo + item_sucursal IN (SELECT I.item_numero + I.item_tipo + I.item_sucursal 
+																FROM inserted i
+																GROUP BY I.item_numero + I.item_tipo + I.item_sucursal)
+		DELETE FROM Factura
+			WHERE fact_numero + fact_tipo + fact_sucursal IN (SELECT I.item_numero + I.item_tipo + I.item_sucursal 
+																FROM inserted i
+																GROUP BY I.item_numero + I.item_tipo + I.item_sucursal)
+		RAISERROR('NO SE PUEDE CREAR UNA FACTURA CON ITEMS COMPUESTOS, BORRANDO ITEMS Y FACTURA', 1,1)
+	END
+END
+
 
 /*27. Se requiere reasignar los encargados de stock de los diferentes depósitos. Para
 ello se solicita que realice el o los objetos de base de datos necesarios para
